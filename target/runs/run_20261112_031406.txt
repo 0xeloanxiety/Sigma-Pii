@@ -1,0 +1,59 @@
+Loading codebase from: /home/divyanshtech/BLOCKCHAIN/AI-Auditor/Sigma-Pi/target/src
+Loaded 93,576 chars. Asking the agent...
+
+=== 5 finding(s) ===
+
+[1] HIGH  —  Partial vesting transfers can overpay the grantor and make the plan insolvent
+    location: SecondSwap_StepVesting.sol:229-230
+    what:     transferVesting reduces totalAmount and preserves amountClaimed and stepsClaimed, but recalculates the grantor's releaseRate as totalAmount / numOfSteps instead of (totalAmount - amountClaimed) / (numOfSteps - stepsClaimed). claimable() then pays releaseRate * claimableSteps without capping the result against the grantor's remaining allocation unless the terminal-step branch is reached.
+    impact:   A seller who has already claimed part of a vesting schedule can list tokens and later claim more tokens than remain in their allocation. The vesting contract becomes undercollateralized, causing subsequent buyers' claims to revert or lose tokens. For example, with 100 tokens over 10 steps, after claiming 50 tokens at step 5, listing 20 tokens changes the grantor's total to 80 but releaseRate to 8. At step 9, the grantor can claim 32 more tokens, reaching amountClaimed 82 against totalAmount 80.
+    exploit:
+      1. Create a 10-step vesting schedule containing 100 tokens and fund the vesting contract.
+      2. Wait until step 5 and have the beneficiary claim 50 tokens.
+      3. List 20 tokens through the marketplace, causing the marketplace manager to call transferVesting.
+      4. Complete a purchase of the 20 listed tokens so the manager retains the corresponding vesting allocation for the buyer.
+      5. Before the final step, at step 9, have the original seller call claim(). claimable() returns 32 tokens because releaseRate was reset to 80 / 10.
+      6. At the final step, have the buyer call claim(). The buyer is entitled to 20 tokens, but only 18 tokens remain in the vesting contract, so the transfer reverts.
+
+[2] HIGH  —  Schedules with more steps than seconds have a zero step duration and permanently lock claims
+    location: SecondSwap_StepVesting.sol:133 and SecondSwap_StepVesting.sol:172-174
+    what:     The constructor calculates stepDuration as (_endTime - _startTime) / _numOfSteps, while SecondSwap_VestingDeployer only checks that steps is greater than zero. If the schedule duration is shorter than the number of steps, stepDuration becomes zero. Once the schedule starts, claimable() performs elapsedTime / stepDuration, which always reverts.
+    impact:   All vesting allocations in such a schedule become unclaimable after the start time, permanently locking the underlying tokens unless an authorized operator can migrate them through an external recovery process.
+    exploit:
+      1. As an authorized token owner, deploy a vesting schedule with a duration of 1 second and 2 steps.
+      2. Create and fund a vesting allocation for a beneficiary.
+      3. After the start time, call claim() or claimable() for the beneficiary.
+      4. The division by zero at elapsedTime / stepDuration reverts, and every subsequent claim attempt remains unavailable because the immutable stepDuration is zero.
+
+[3] MEDIUM  —  Non-divisible schedules can set stepsClaimed above numOfSteps and block future allocations
+    location: SecondSwap_StepVesting.sol:167-185 and 197-199
+    what:     stepDuration uses integer division, but claimable() computes currentStep as elapsedTime / stepDuration without capping it to numOfSteps. For schedules where this quotient exceeds numOfSteps at endTime, the terminal claim increments stepsClaimed by more than the configured number of steps.
+    impact:   After a beneficiary claims at the end of such a schedule, stepsClaimed can exceed numOfSteps. Any later vesting addition or marketplace purchase for that beneficiary reverts at numOfSteps - stepsClaimed in _createVesting, permanently preventing that address from receiving further allocations from the plan.
+    exploit:
+      1. Deploy a schedule with startTime 0, endTime 8, and numOfSteps 3. The resulting stepDuration is 2 seconds.
+      2. Create a vesting allocation for a beneficiary and wait until endTime.
+      3. Call claim(). currentStep is 8 / 2 = 4, so claimableSteps is 4 and stepsClaimed becomes 4 even though numOfSteps is 3.
+      4. Attempt to add another allocation to the beneficiary or complete another marketplace purchase for that beneficiary.
+      5. The existing-allocation path evaluates numOfSteps - stepsClaimed, which underflows and reverts.
+
+[4] MEDIUM  —  Referral rewards are calculated but never transferred
+    location: SecondSwap_Marketplace.sol:478-492
+    what:     _handleTransfers computes referralFeeCost and spotPurchase emits it as referralReward, but no transfer is made to _referral or to marketplaceSetting.referralFeeCollector(). The fee collector instead receives the full buyerFeeTotal plus sellerFeeTotal.
+    impact:   Referrers receive no referral reward despite qualifying purchases, while the marketplace fee collector retains the amount represented as the referral reward. The Purchased event falsely reports a referral reward amount that was not paid.
+    exploit:
+      1. Configure a nonzero buyer fee and referral fee.
+      2. Create a non-whitelisted listing and approve the marketplace to spend the payment currency.
+      3. Call spotPurchase() with a nonzero referral address different from the buyer.
+      4. Observe that the referral address receives no payment and referralFeeCollector() is never used.
+      5. Observe that feeCollector receives the entire buyer fee and seller fee, while the event reports a nonzero referralReward.
+
+[5] MEDIUM  —  Anyone can exhaust a private sale's whitelist using sybil addresses
+    location: SecondSwap_Whitelist.sol:57-63
+    what:     whitelistAddress() allows any caller to enroll itself and consumes one of the finite whitelist slots. There is no seller-controlled allowlist insertion, authorization, or reservation mechanism; setMaxWhitelist() only permits increasing the cap and cannot remove already-enrolled addresses.
+    impact:   An attacker can use multiple addresses to fill all whitelist slots immediately after a private listing is created, preventing intended participants from becoming whitelisted and denying them access to the sale until the seller increases the cap.
+    exploit:
+      1. Create a private listing with a maximum whitelist size of N.
+      2. Obtain the deployed whitelist address from the WhitelistCreated event.
+      3. From N attacker-controlled addresses, call whitelistAddress() once per address.
+      4. The whitelist reaches its maximum capacity.
+      5. Intended buyers call whitelistAddress() and each transaction reverts with Reached whitelist limit, preventing them from purchasing the private listing.

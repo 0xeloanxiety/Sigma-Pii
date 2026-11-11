@@ -1,0 +1,47 @@
+Loading codebase from: /home/divyanshtech/BLOCKCHAIN/AI-Auditor/Sigma-Pi/target/src
+Loaded 93,576 chars. Asking the agent...
+
+=== 4 finding(s) ===
+
+[1] HIGH  —  Partial vesting transfers enable overclaiming and drain other allocations
+    location: SecondSwap_StepVesting.sol:216-232
+    what:     transferVesting reduces totalAmount but leaves amountClaimed unchanged and resets releaseRate to totalAmount / numOfSteps instead of recalculating it from the remaining amount and remaining steps. claimable() then pays releaseRate * claimableSteps without capping the result against totalAmount - amountClaimed except at the final step.
+    impact:   A beneficiary who has already claimed part of a vesting schedule can list or otherwise transfer part of the remaining allocation and then claim more than the adjusted allocation. The excess is paid from the vesting contract's pooled token balance, potentially underfunding buyers or other beneficiaries.
+    exploit:
+      1. Create a 10-step vesting schedule with totalAmount 100 for a seller and allow the seller to claim the first 5 steps, resulting in amountClaimed 50 and stepsClaimed 5.
+      2. List 20 tokens through the marketplace. With the default 20% max sell percentage, this amount is permitted. transferVesting reduces totalAmount to 80 but sets releaseRate to 80 / 10 = 8.
+      3. Complete a purchase so the marketplace-held 20 tokens are transferred to the buyer's vesting allocation rather than returned to the seller.
+      4. At steps 6 through 9, have the seller claim 8 tokens per step. The seller receives 32 tokens even though only 30 tokens remained in the seller's adjusted allocation.
+      5. The seller's amountClaimed becomes 82 while totalAmount is only 80. The excess 2 tokens are taken from the vesting contract balance and the buyer's 20-token allocation becomes underfunded.
+
+[2] HIGH  —  Vesting schedules with more steps than seconds are permanently unclaimable
+    location: SecondSwap_StepVesting.sol:117-134 and 161-174
+    what:     The constructor computes stepDuration as (_endTime - _startTime) / _numOfSteps without requiring the duration to be at least the number of steps. For a positive duration smaller than _numOfSteps, stepDuration becomes zero. claimable() then divides elapsedTime by stepDuration.
+    impact:   Every non-empty vesting schedule created with stepDuration == 0 cannot be claimed because claimable() always reverts after the start time. The marketplace does not validate this invariant, so buyers can pay for vesting allocations that are permanently inaccessible.
+    exploit:
+      1. Deploy a vesting schedule through SecondSwap_VestingDeployer with startTime 1000, endTime 1001, and steps 2. The deployer only checks steps > 0, so deployment succeeds and stepDuration becomes zero.
+      2. Create a vesting allocation for a beneficiary and make the plan sellable.
+      3. List the allocation and have a buyer complete a marketplace purchase.
+      4. After startTime, call claim() for the seller or buyer. claimable() executes elapsedTime / stepDuration with a zero divisor and reverts, permanently preventing claims.
+
+[3] MEDIUM  —  Referral rewards are calculated but never transferred
+    location: SecondSwap_Marketplace.sol:478-492
+    what:     _handleTransfers calculates referralFeeCost when a referral is supplied, but performs no transfer to _referral or referralFeeCollector. The only subsequent payment transfers go to the seller and feeCollector, while Purchased emits referralFeeCost as if the reward had been paid.
+    impact:   Referrers receive no referral reward. The portion represented by referralFeeCost remains with the fee collector, and the emitted event misleadingly reports a reward that was never transferred.
+    exploit:
+      1. Create a public listing with a nonzero buyer fee and approve the payment currency for a purchase.
+      2. Call spotPurchase with a distinct nonzero _referral address.
+      3. _handleTransfers computes a nonzero referralFeeCost.
+      4. Observe that the function transfers payment only to the seller and feeCollector; no transfer is made to the referral address or referralFeeCollector.
+      5. The transaction emits Purchased with a nonzero referralReward even though the referrer received nothing.
+
+[4] MEDIUM  —  Penalty fee uses 18-decimal wei units for an arbitrary USDT token
+    location: SecondSwap_MarketplaceSetting.sol:142-150 and SecondSwap_Marketplace.sol:347-359
+    what:     The default penaltyFee is set to 10 ether, but unlistVesting passes that value directly to the configured usdt token's balanceOf and safeTransferFrom without converting for the token's decimals. With standard 6-decimal USDT, the default value represents 10^13 USDT base units rather than 10 USDT.
+    impact:   Sellers cannot early-unlist unless they hold and approve an extremely large amount of a 6-decimal USDT token. Their listed vesting is effectively locked until minListingDuration expires; the issue is worse if the administrator configures a longer minimum duration.
+    exploit:
+      1. Configure the settings contract with a standard 6-decimal USDT token and leave the default penaltyFee of 10 ether.
+      2. Create and list a vesting position.
+      3. Before minListingDuration elapses, call unlistVesting.
+      4. The balance check requires at least 10^19 raw USDT units, equivalent to 10^13 USDT, and safeTransferFrom attempts to charge the same amount.
+      5. Unless the seller has that amount and allowance, unlisting reverts and the seller must wait until the minimum listing duration expires.

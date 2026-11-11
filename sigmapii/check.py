@@ -30,7 +30,7 @@ def main() -> None:
     except Exception as err:  # noqa: BLE001 - we want a friendly one-liner, not a trace
         msg = str(err)
         if "model_not_found" in msg or "does not exist" in msg or "model not found" in msg.lower():
-            print("  model_not_found: the MODEL id in lucid/llm.py is not one your provider serves.")
+            print("  model_not_found: the MODEL id in sigmapii/llm.py is not one your provider serves.")
             print("  Swap it for a real model (keep OPENAI_BASE_URL if you route through a gateway).")
         else:
             print(f"  call failed: {msg}")

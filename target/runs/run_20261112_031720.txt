@@ -1,0 +1,37 @@
+Loading codebase from: /home/divyanshtech/BLOCKCHAIN/AI-Auditor/Sigma-Pi/target/src
+Loaded 93,576 chars. Asking the agent...
+
+=== 3 finding(s) ===
+
+[1] HIGH  —  Post-claim vesting transfers allow beneficiaries to claim beyond their allocation
+    location: SecondSwap_StepVesting.sol:216-230
+    what:     transferVesting reduces totalAmount but leaves amountClaimed and stepsClaimed unchanged, then recalculates releaseRate as grantorVesting.totalAmount / numOfSteps. After a beneficiary has already claimed tokens, this rate is not based on the remaining amount or remaining steps. claimable() subsequently calculates intermediate claims as releaseRate * claimableSteps without capping against totalAmount - amountClaimed. For example, with a 100-token, 10-step schedule, after claiming 50 tokens over five steps, listing 20 remaining tokens reduces totalAmount to 80 while amountClaimed remains 50 and sets releaseRate to 8. The beneficiary can then claim 8 tokens per step even though only 30 tokens remain, causing amountClaimed to exceed totalAmount.
+    impact:   A seller can claim tokens that have been transferred into the marketplace allocation. This consumes tokens reserved for marketplace buyers or other beneficiaries, causing later claims to revert or leaving the vesting contract underfunded.
+    exploit:
+      1. Create a 100-token vesting schedule with 10 steps and create the corresponding vesting allocation for the attacker.
+      2. Wait until five steps have elapsed and claim the first 50 tokens.
+      3. List 20 tokens through the marketplace. The default 20% max-sell setting permits this, and the marketplace manager calls transferVesting, reducing totalAmount from 100 to 80 while amountClaimed remains 50.
+      4. At the next vesting steps, call claim repeatedly. releaseRate is now 80 / 10 = 8, so claimable() returns 8 tokens per intermediate step despite only 30 tokens remaining.
+      5. After four such claims, amountClaimed becomes 82 while totalAmount is only 80, stealing two tokens from the marketplace allocation and causing subsequent accounting or claims to fail.
+
+[2] HIGH  —  Zero step duration permanently locks vesting allocations
+    location: SecondSwap_StepVesting.sol:117-134 and SecondSwap_VestingDeployer.sol:104-117
+    what:     The deployer validates only startTime < endTime and steps > 0. It does not require endTime - startTime >= steps. The StepVesting constructor computes stepDuration = (endTime - startTime) / numOfSteps, which becomes zero when the number of steps exceeds the schedule duration. Once the schedule starts, claimable() divides elapsedTime by stepDuration at line 173, causing every claimable() and claim() call to revert permanently because stepDuration is immutable.
+    impact:   Any allocations created in a vesting schedule with more steps than seconds in its duration cannot be claimed, permanently locking the deposited token balance in the vesting contract.
+    exploit:
+      1. The token owner calls deployVesting with, for example, startTime = 1000, endTime = 1002, and steps = 3. All deployer checks pass.
+      2. Create one or more vesting allocations in the deployed StepVesting contract, transferring tokens into it.
+      3. After startTime, a beneficiary calls claim().
+      4. claimable() reaches elapsedTime / stepDuration, where stepDuration is zero, and the call reverts.
+      5. Because the duration fields are immutable and there is no recovery or alternate claim path, the allocated tokens remain locked.
+
+[3] MEDIUM  —  Referral rewards are calculated but never transferred
+    location: SecondSwap_Marketplace.sol:478-492
+    what:     _handleTransfers computes referralFeeCost for a nonzero referral, but never transfers any payment token to the referral address or a referral fee collector. Instead, feeCollectorTotal includes the entire buyerFeeTotal and sellerFeeTotal and the full amount is sent to feeCollector. The Purchased event nevertheless reports referralFeeCost as a referral reward.
+    impact:   Referrers receive zero of the configured referral reward. The fee collector retains the referral portion of every buyer fee, violating the marketplace's referral-fee accounting and misleading users through the emitted event.
+    exploit:
+      1. Use a public listing with a nonzero marketplace buyer fee and configure referralFee to its default nonzero value.
+      2. A buyer purchases tokens while supplying a distinct referral address.
+      3. _handleTransfers calculates referralFeeCost.
+      4. Observe that no transfer is made to the referral address, while feeCollector receives buyerFeeTotal plus sellerFeeTotal in full.
+      5. The Purchased event reports a referral reward even though the referrer received nothing.
