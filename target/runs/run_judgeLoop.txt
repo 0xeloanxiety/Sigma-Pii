@@ -1,0 +1,367 @@
+=== 36 finding(s) ===
+
+[1] HIGH  —  Self-purchases bypass the maximum sell limit
+    location: SecondSwap_Marketplace.sol:_validatePurchase; SecondSwap_VestingManager.sol:listVesting and completePurchase
+    what:     _validatePurchase checks listing status, amount, whitelist, and referral validity but never requires the buyer to differ from listing.seller. completePurchase increments allocations[buyer][vesting].bought while transferring the allocation back to the same address. listVesting then uses bought as additional sell capacity in its sell-limit calculation.
+    impact:   A seller can wash-trade listings with themselves to inflate bought and sold accounting while retaining the same vesting allocation, eventually selling far more than the vesting plan's configured maximum percentage.
+    exploit:
+      1. Obtain a 100-token allocation in a sellable plan with maxSellPercent set to 2000 (20%).
+      2. List 20 tokens and call spotPurchase for the listing from the same address recorded as listing.seller.
+      3. The purchase succeeds, the allocation returns to the seller, and bought and sold each increase by 20 tokens.
+      4. Repeat the list-and-self-purchase cycle until the sell-limit calculation permits the remaining allocation.
+      5. Sell the inflated amount to an unrelated buyer despite the original 20% maximum.
+
+[2] HIGH  —  Same-token owners can operate another issuer's vesting plans
+    location: SecondSwap_VestingDeployer.sol:setTokenOwner, createVesting, createVestings, and transferVesting
+    what:     setTokenOwner only checks that the owner address is unused and permits multiple owners to map to the same token. The create and transfer functions authorize callers solely with `_tokenOwner[msg.sender] == SecondSwap_StepVesting(_stepVesting).token()`, without checking that the caller is the target plan's tokenIssuer. The deployer is itself authorized by StepVesting, so it acts as a confused deputy.
+    impact:   A registered owner of a token can create allocations funded from another issuer's approved balance or transfer available allocations from another issuer's beneficiaries to an attacker-controlled address.
+    exploit:
+      1. Have the administrator register issuer A and attacker B for the same token T.
+      2. Have A deploy a StepVesting plan for T and create an allocation for victim V.
+      3. From B, call transferVesting(V, B, amount, plan, transactionId) through the deployer.
+      4. The token-only authorization passes and the target plan accepts the deployer as an authorized caller.
+      5. The victim's available allocation is transferred to B, who can later claim it.
+      6. Alternatively, call createVesting(B, amount, plan) after the issuer has approved the plan; the plan pulls the amount from issuer A while crediting B.
+
+[3] HIGH  —  Transfers after partial claims allow grantors to overclaim
+    location: SecondSwap_StepVesting.sol:transferVesting lines 223-232 and claimable lines 167-185
+    what:     After reducing grantorVesting.totalAmount, transferVesting resets releaseRate to `grantorVesting.totalAmount / numOfSteps`, ignoring amountClaimed and stepsClaimed. claimable multiplies this rate by claimableSteps and does not cap intermediate claims at totalAmount - amountClaimed.
+    impact:   A grantor can claim more than the remaining allocation after transferring tokens. The excess is paid from tokens backing other beneficiaries or marketplace buyers, potentially making the vesting contract insolvent and later claims fail.
+    exploit:
+      1. Create a 1,000-token, 10-step allocation for Alice.
+      2. After step 8, have Alice claim 800 tokens.
+      3. Transfer Alice's remaining 200 tokens through the vesting manager, reducing totalAmount to 800 while amountClaimed remains 800.
+      4. At step 9, call claim as Alice; releaseRate is 80 and claimable returns 80 even though Alice has no remaining available allocation.
+      5. The vesting contract transfers the excess from its pooled balance, underfunding other allocations.
+
+[4] HIGH  —  Zero step duration permanently locks vesting allocations
+    location: SecondSwap_VestingDeployer.sol:deployVesting lines 115-117; SecondSwap_StepVesting.sol:constructor lines 130-133 and claimable lines 172-174
+    what:     deployVesting requires only startTime < endTime and steps > 0. The StepVesting constructor calculates `stepDuration = (_endTime - _startTime) / _numOfSteps`, which becomes zero when the schedule duration is shorter than the number of steps. claimable then divides elapsedTime by stepDuration.
+    impact:   Every allocation in the malformed plan becomes unclaimable after startTime because claimable and claim revert on division by zero, permanently locking the backing tokens.
+    exploit:
+      1. Deploy a plan with a one-second duration and two steps.
+      2. Create a nonzero allocation in the resulting plan.
+      3. After startTime, call claim or claimable for the beneficiary.
+      4. The calculation `elapsedTime / stepDuration` divides by zero and reverts, including after endTime.
+
+[5] HIGH  —  Former marketplace administrator can drain manager-held allocations
+    location: SecondSwap_MarketplaceSetting.sol:setS2Admin lines 231-236; SecondSwap_VestingManager.sol:setMarketplace lines 204-205 and completePurchase lines 161-164
+    what:     Rotating MarketplaceSetting.s2Admin does not update VestingManager.s2Admin. The former administrator can therefore call manager.setMarketplace with an attacker-controlled address. completePurchase checks only the mutable marketplace address and does not verify a listing, payment, or purchase authorization.
+    impact:   After an admin rotation, the former administrator can authorize itself as the marketplace and transfer all allocations currently held by the manager to an arbitrary address without paying sellers.
+    exploit:
+      1. Ensure administrator A controls both settings and manager, and that the manager holds allocations backing active listings.
+      2. Rotate only MarketplaceSetting.s2Admin from A to B.
+      3. A calls VestingManager.setMarketplace(A), which still succeeds because the manager's s2Admin remains A.
+      4. A calls completePurchase(A, vestingPlan, amount) directly.
+      5. The manager transfers the held allocation from its own vesting record to A without any listing or payment validation.
+
+[6] MEDIUM  —  Truncated step duration overshoots vesting steps
+    location: SecondSwap_StepVesting.sol:constructor lines 130-133 and claimable lines 167-185
+    what:     stepDuration is rounded down and claimable computes `currentStep = elapsedTime / stepDuration` without capping it to numOfSteps. For a 10-second schedule with four steps, stepDuration is two seconds, so the fourth step is reached at startTime + 8 and currentStep is five at endTime.
+    impact:   The entire allocation can become claimable before the configured endTime. A beneficiary claiming at or after endTime can store stepsClaimed greater than numOfSteps, causing later allocations, purchases, or transfers to that beneficiary to revert on `numOfSteps - stepsClaimed`.
+    exploit:
+      1. Deploy a plan with duration 10 seconds and four steps.
+      2. Create an allocation and wait until startTime + 8, before endTime.
+      3. Call claim; the contract treats all remaining tokens as claimable.
+      4. Alternatively, wait until endTime and claim, causing stepsClaimed to become five.
+      5. Attempt to add or transfer an allocation to the beneficiary; _createVesting reverts when subtracting five from four.
+
+[7] MEDIUM  —  Post-completion top-ups cannot be transferred to new beneficiaries
+    location: SecondSwap_StepVesting.sol:_createVesting lines 288-303 and transferVesting lines 216-233
+    what:     When an existing beneficiary has stepsClaimed == numOfSteps, _createVesting accepts a top-up but sets releaseRate to zero. If that top-up is later transferred to a beneficiary without an existing record, transferVesting passes numOfSteps as _stepsClaimed and the new-beneficiary branch computes `_totalAmount / (numOfSteps - _stepsClaimed)`, causing division by zero.
+    impact:   Valid post-completion allocations cannot be transferred or listed to a fresh beneficiary, blocking the corresponding marketplace and vesting-transfer flows.
+    exploit:
+      1. Create and fully claim an allocation for Alice so that Alice's stepsClaimed equals numOfSteps.
+      2. Create a new positive allocation for Alice after completion.
+      3. Attempt to transfer or list that top-up to Bob or the marketplace manager.
+      4. The recipient has no existing record, so _createVesting divides by zero using numOfSteps - stepsClaimed.
+
+[8] MEDIUM  —  Aggregated manager custody loses each listing's vesting progress
+    location: SecondSwap_StepVesting.sol:_createVesting lines 288-304 and transferVesting line 232; SecondSwap_VestingManager.sol:listVesting and completePurchase
+    what:     All marketplace listings are consolidated under the manager address. When that address already has a vesting record, _createVesting adds the new amount but retains the manager record's existing stepsClaimed and ignores the incoming seller's stepsClaimed. completePurchase then transfers from this pooled record and initializes buyers with the pooled step history.
+    impact:   Purchased allocations can unlock earlier or later than the source seller's schedule. A later seller's partially vested allocation can inherit an earlier listing's lower stepsClaimed value and become prematurely claimable.
+    exploit:
+      1. Use a ten-step plan and have seller A list before vesting begins, creating a manager record with stepsClaimed equal to zero.
+      2. Advance to step five, have seller B claim the first five steps, and list part of B's remaining allocation.
+      3. The manager record retains stepsClaimed zero instead of B's stepsClaimed five.
+      4. Purchase B's listing as a buyer.
+      5. At step five, the buyer can claim tokens using the manager's zero-step history even though B's source allocation had already progressed five steps.
+
+[9] MEDIUM  —  Out-of-range discounts create permanently unpurchasable listings
+    location: SecondSwap_Marketplace.sol:listVesting lines 257-260 and _getDiscountedPrice lines 413-420
+    what:     listVesting requires a non-NO discount to be greater than zero but never enforces discountPct <= BASE. A FIX discount above 10000 causes `BASE - listing.discountPct` to underflow during purchase; a FIX discount of exactly 10000 produces a zero price that later fails the positive baseAmount check.
+    impact:   A seller can escrow vesting tokens in an active listing that no buyer can purchase. Recovery requires waiting for the listing duration or paying the early-unlisting penalty.
+    exploit:
+      1. Create a valid listing with DiscountType.FIX and discountPct equal to 10001.
+      2. The listing passes validation and the manager takes custody of the allocation.
+      3. Have a buyer call spotPurchase.
+      4. The fixed discount calculation underflows at BASE - discountPct and every purchase reverts.
+
+[10] MEDIUM  —  Per-purchase price rounding enables underpayment
+    location: SecondSwap_Marketplace.sol:_handleTransfers lines 459-471
+    what:     Each partial purchase independently floors `(_amount * discountedPrice) / 10**decimals`. The contract does not preserve fractional payment remainder across purchases.
+    impact:   A buyer can split a purchase into chunks and pay materially less than the price of the aggregate amount, directly reducing seller proceeds.
+    exploit:
+      1. Create a PARTIAL no-discount listing for 1,000 raw units of a two-decimal vesting token with pricePerUnit equal to one and minPurchaseAmt equal to zero.
+      2. Purchase 199 raw units five times.
+      3. Each purchase costs floor(199 / 100) = one payment unit, so 995 vesting units cost five units instead of approximately 9.95 units.
+      4. The buyer keeps the underpayment while receiving almost the entire listing.
+
+[11] MEDIUM  —  Purchase splitting bypasses buyer and seller fees
+    location: SecondSwap_Marketplace.sol:_handleTransfers lines 473-474
+    what:     Buyer and seller fees are rounded down independently for every purchase, with no minimum fee-bearing amount or cumulative fee accounting.
+    impact:   A buyer can split a listing into transactions whose individual baseAmount is below BASE / feeRate and avoid both configured fees, depriving the fee collector of revenue.
+    exploit:
+      1. Create a PARTIAL listing with minPurchaseAmt equal to zero and a price configuration producing baseAmount equal to one for each small purchase.
+      2. Use the default 250-basis-point buyer and seller fees.
+      3. Execute many purchases with baseAmount equal to one.
+      4. Each calculation floors 1 * 250 / 10000 to zero, so no buyer or seller fees are charged.
+
+[12] MEDIUM  —  Existing listings use live fee settings
+    location: SecondSwap_Marketplace.sol:listVesting lines 306-320 and _getFees lines 432-435
+    what:     Listing records do not store buyer or seller fee rates. spotPurchase calls _getFees at execution time, which reads the current plan overrides and marketplace-wide defaults.
+    impact:   An administrator can retroactively change the economics of active listings. A seller who listed under a 2.5% seller fee can receive only the amount remaining after a later 50% fee update.
+    exploit:
+      1. Create a listing while the default buyer and seller fees are 250 basis points.
+      2. After listing creation, change the marketplace seller or buyer fee to another permitted value.
+      3. Have a buyer purchase the existing listing.
+      4. Observe that settlement uses the updated fee rather than the rate in effect when the listing was created.
+
+[13] MEDIUM  —  Live unlisting settings change the terms of existing listings
+    location: SecondSwap_Marketplace.sol:unlistVesting lines 346-360
+    what:     Listings store listTime but do not snapshot minListingDuration or penaltyFee. Seller unlisting reads both values from the current marketplace settings.
+    impact:   Administrative changes can retroactively reduce or increase the time and penalty required to recover an existing listing, allowing premature penalty-free recovery or forcing sellers to pay more than the original terms.
+    exploit:
+      1. Create a listing while minListingDuration is 120 seconds and penaltyFee is 10 USDT.
+      2. Before the original duration expires, change the duration or penalty through the settings contract.
+      3. Call unlistVesting for the existing listing.
+      4. The unlisting decision and charged penalty use the newly configured values.
+
+[14] MEDIUM  —  Changing the configured marketplace manager strands existing listings
+    location: SecondSwap_Marketplace.sol:unlistVesting lines 363-367 and spotPurchase lines 533-538; SecondSwap_MarketplaceSetting.sol:setManager lines 285-291
+    what:     The marketplace does not record the manager used by each listing and resolves vestingManager dynamically from settings. Existing allocations remain held by the old manager, while subsequent settlement calls are sent to the replacement manager. Existing StepVesting plans also authorize their original manager, not the replacement.
+    impact:   Listings created before the manager rotation cannot be purchased or unlisted. Their allocations remain held by the old manager until the old configuration is restored or a migration is performed.
+    exploit:
+      1. Create a listing while marketplace settings point to manager V1; V1 receives the listed allocation.
+      2. Change the settings contract to use manager V2 and configure V2 as the marketplace.
+      3. Call unlistVesting or spotPurchase for the old listing.
+      4. The marketplace calls V2, which is not authorized by the StepVesting plan and does not hold the allocation, so settlement reverts.
+
+[15] MEDIUM  —  Replacing the manager-authorized marketplace locks old listings
+    location: SecondSwap_VestingManager.sol:setMarketplace lines 204-205 and onlyMarketplace lines 89-91
+    what:     setMarketplace replaces the sole authorized marketplace without preserving the previous authorization or migrating listing state. Existing listings remain recorded in the old marketplace and their allocations remain under this manager.
+    impact:   After rotation, the old marketplace cannot call unlistVesting or completePurchase, while the new marketplace has no corresponding listing records. Existing allocations become stranded until the old marketplace is restored.
+    exploit:
+      1. Create an active listing through marketplace M1 and allow the manager to receive the allocation.
+      2. Call VestingManager.setMarketplace(M2).
+      3. Attempt to purchase or unlist through M1.
+      4. The manager's onlyMarketplace modifier rejects M1, while M2 has no listing record to operate.
+
+[16] MEDIUM  —  Vesting deployer rotation does not update existing plans
+    location: SecondSwap_VestingManager.sol:setVestingDeployer lines 247-250; SecondSwap_StepVesting.sol:constructor lines 126-128 and authorization lines 216-220 and 244-249
+    what:     The manager's setVestingDeployer changes only the manager configuration. Each existing StepVesting stores the old deployer immutably in its vestingDeployer state and continues authorizing only that address.
+    impact:   The newly configured deployer cannot create or transfer allocations in existing vesting plans, causing a recoverable denial of service for those administrative operations. The old deployer remains authorized in those plans.
+    exploit:
+      1. Deploy a plan through deployer D1; the plan records D1 as vestingDeployer.
+      2. Set the manager's vestingDeployer to D2.
+      3. Register the token owner on D2 and call D2.createVesting or D2.transferVesting for the old plan.
+      4. The target plan rejects D2 because its stored vestingDeployer is still D1.
+
+[17] MEDIUM  —  Re-enabling a plan overwrites an explicit zero sell limit
+    location: SecondSwap_VestingManager.sol:setSellable lines 173-185 and setMaxSellPercent lines 194-197
+    what:     setSellable treats maxSellPercent == 0 as an uninitialized sentinel every time a plan is enabled. An issuer can explicitly set maxSellPercent to zero, but a later setSellable(vesting, true) changes it to 2000.
+    impact:   A plan configured with a 0% sale limit can be reopened with a 20% limit, allowing policy-restricted allocations to be listed and sold.
+    exploit:
+      1. Mark a plan sellable so its settings are initialized.
+      2. As the plan issuer, call setMaxSellPercent(plan, 0).
+      3. Disable and then re-enable the plan, or call setSellable(plan, true) again.
+      4. The manager replaces the explicit zero with 2000, after which sellers can list up to 20%.
+
+[18] MEDIUM  —  Preconfigured sell limits silently disable plan fees
+    location: SecondSwap_VestingManager.sol:setMaxSellPercent lines 194-197 and setSellable lines 176-182
+    what:     If the issuer calls setMaxSellPercent with a nonzero value before the plan is first marked sellable, setSellable skips initialization of buyerFee and sellerFee. Their default int256 values remain zero, which _getFees interprets as explicit zero-fee overrides.
+    impact:   Purchases for the plan bypass marketplace-wide buyer and seller fees until an administrator manually sets the overrides.
+    exploit:
+      1. Deploy a plan whose settings are initially uninitialized.
+      2. Before enabling it, have the token issuer call setMaxSellPercent(plan, 2000).
+      3. Enable the plan with setSellable(plan, true).
+      4. Create and purchase a listing; getVestingFees returns zero for both fees, so marketplace defaults are not applied.
+
+[19] MEDIUM  —  Unbounded maximum sell percentages can bypass limits or brick listings
+    location: SecondSwap_VestingManager.sol:setMaxSellPercent lines 194-197 and listVesting lines 127-138
+    what:     setMaxSellPercent accepts arbitrary uint256 values instead of limiting the value to BASE. listVesting multiplies the available allocation by maxSellPercent using checked arithmetic.
+    impact:   Values above 10000 can permit selling the full allocation despite the intended percentage cap, while extreme values such as type(uint256).max overflow and make every listing revert.
+    exploit:
+      1. As the plan issuer, set maxSellPercent to a value greater than 10000.
+      2. List an allocation and observe that the calculated sell limit can exceed the entire allocation.
+      3. Alternatively, set maxSellPercent to type(uint256).max.
+      4. Attempt any positive listing; the multiplication in the sell-limit calculation overflows and the listing reverts.
+
+[20] MEDIUM  —  Listing price normalization overflows before decimal scaling
+    location: SecondSwap_Marketplace.sol:listVesting lines 276-287
+    what:     The marketplace computes `(_amount * _price) / 10**decimals` using checked multiplication before applying the decimal denominator. It does not use an overflow-safe mulDiv operation.
+    impact:   Legitimate high-value listings whose normalized payment amount fits uint256 can still revert because the unscaled product exceeds uint256.
+    exploit:
+      1. Use a vesting token with 18 decimals.
+      2. Provide an allocation of 2^130 raw units and attempt to list it at price 2^130.
+      3. The normalized result would fit after division by 10^18.
+      4. The intermediate product 2^260 overflows at listing creation and the listing reverts.
+
+[21] MEDIUM  —  Unbounded vesting-token decimals overflow marketplace scaling
+    location: SecondSwap_Marketplace.sol:listVesting lines 276-288 and _handleTransfers lines 459-470
+    what:     The marketplace evaluates `10 ** IERC20Extended(token).decimals()` without bounding the token-reported decimals. A token reporting 78 or more decimals causes the uint256 exponentiation to overflow.
+    impact:   Allocations backed by such a token cannot be listed or purchased through the marketplace.
+    exploit:
+      1. Use an ERC20 whose decimals() returns 78.
+      2. Deploy a sellable vesting plan backed by that token and create an allocation.
+      3. Call listVesting with otherwise valid parameters.
+      4. The decimal scaling expression overflows before the listing is created.
+
+[22] MEDIUM  —  Purchase-time discount multiplication can overflow
+    location: SecondSwap_Marketplace.sol:_getDiscountedPrice lines 416-420
+    what:     The LINEAR and FIX discount paths multiply caller-controlled values before division. Listing validation checks only the undiscounted amount-price product and does not ensure the later discount products fit uint256.
+    impact:   A valid listing can become permanently unpurchasable when every purchase reverts during discount calculation.
+    exploit:
+      1. Use a zero-decimal vesting token and create a one-unit listing at price type(uint256).max.
+      2. Use a valid FIX discount of one basis point.
+      3. The listing-time product fits and the listing is created.
+      4. A buyer attempts to purchase; pricePerUnit * 9999 overflows in _getDiscountedPrice.
+
+[23] MEDIUM  —  Fee multiplication overflows on otherwise valid purchases
+    location: SecondSwap_Marketplace.sol:_handleTransfers lines 473-474
+    what:     Buyer and seller fees are calculated as `(baseAmount * fee) / BASE` with checked multiplication and no bound on baseAmount.
+    impact:   A listing with a representable base amount can become unpurchasable because fee calculation reverts before payment or vesting settlement.
+    exploit:
+      1. Use a zero-decimal vesting token and an allocation of at least five units so one unit can satisfy the 20% sell limit.
+      2. List one unit at price type(uint256).max with no discount, producing baseAmount equal to type(uint256).max.
+      3. Attempt a purchase under the default 250-basis-point buyer fee.
+      4. The multiplication by 250 overflows and the purchase reverts.
+
+[24] MEDIUM  —  Buyer payment addition can overflow after fees are calculated
+    location: SecondSwap_Marketplace.sol:_handleTransfers line 476
+    what:     The marketplace transfers `baseAmount + buyerFeeTotal` without checking whether the addition fits uint256.
+    impact:   Maximum-value listings can be validly created but cannot be purchased whenever a positive buyer fee makes the payment sum exceed uint256.max.
+    exploit:
+      1. Set the buyer fee to one basis point and the seller fee to zero.
+      2. Use a zero-decimal vesting token and create a listing whose baseAmount is type(uint256).max.
+      3. The fee multiplication succeeds because max / 10000 fits.
+      4. The payment expression baseAmount + buyerFeeTotal overflows and spotPurchase reverts.
+
+[25] MEDIUM  —  Referral calculation can overflow valid purchases
+    location: SecondSwap_Marketplace.sol:_handleTransfers lines 479-483
+    what:     For a public purchase with a referral, the contract evaluates `baseAmount * bfee * referralFee` before dividing by BASE squared. It does not use overflow-safe multiplication.
+    impact:   Purchases that succeed without a referral can revert when a referral is supplied, leaving the listing active and restricting buyers from using the referral path.
+    exploit:
+      1. Use the default buyer fee of 250 basis points and referral fee of 1000 basis points.
+      2. Create a zero-decimal listing with a baseAmount between ceil(max/250000) and floor(max/250).
+      3. Call spotPurchase with a nonzero referral address different from the buyer.
+      4. The buyer-fee multiplication fits, but the subsequent multiplication by referralFee overflows.
+
+[26] MEDIUM  —  Linear discounts truncate the discount before pricing
+    location: SecondSwap_Marketplace.sol:_getDiscountedPrice lines 416-417
+    what:     The LINEAR path first computes `(_amount * discountPct) / listing.total`, truncating the proportional discount to whole basis points, and only then applies the remaining percentage to pricePerUnit.
+    impact:   For partial purchases whose size does not divide the listing total, buyers are charged more than the mathematically advertised linear discount.
+    exploit:
+      1. Create a linear listing with total 3,000,000 whole-token units, pricePerUnit 1e18, and discountPct 5000.
+      2. Purchase one third of the listing.
+      3. The proportional discount is truncated from 1666.66 basis points to 1666.
+      4. The buyer is charged using an 8334-basis-point price factor instead of the exact approximately 8333.33-basis-point factor.
+
+[27] MEDIUM  —  Fixed discounts round at unit-price level
+    location: SecondSwap_Marketplace.sol:_getDiscountedPrice lines 418-419 and _handleTransfers lines 459-471
+    what:     FIX discounts calculate `pricePerUnit * (BASE - discountPct) / BASE` first and then scale the purchase amount. This truncates the discounted unit price before decimal scaling and can produce zero for small prices.
+    impact:   Sellers can be underpaid on valid purchases, while some valid discounted listings become impossible to purchase because the rounded discounted price produces baseAmount zero.
+    exploit:
+      1. For the underpayment case, use a two-decimal vesting token and list 200 raw units at pricePerUnit 101 with a 50% fixed discount.
+      2. The contract rounds the discounted unit price to 50 and charges 100 payment units, while applying the discount to the full amount would produce 101 units.
+      3. For the denial-of-service case, list 1e18 raw units of an 18-decimal token at price 1 with a one-basis-point fixed discount.
+      4. The discounted price rounds to zero, so every purchase reverts on baseAmount > 0.
+
+[28] MEDIUM  —  Default USDT penalty uses 18-decimal units
+    location: SecondSwap_MarketplaceSetting.sol:constructor lines 142-150 and SecondSwap_Marketplace.sol:unlistVesting lines 349-360
+    what:     The settings constructor initializes penaltyFee to 10 ether and the marketplace transfers that raw value directly through the configured USDT token without converting for token decimals.
+    impact:   With a conventional six-decimal USDT token, the default penalty represents 10^13 whole USDT units rather than 10 USDT, preventing ordinary sellers from early-unlisting their allocations.
+    exploit:
+      1. Deploy settings with a six-decimal USDT token and leave the default penalty unchanged.
+      2. Create a listing and attempt to unlist it before minListingDuration expires.
+      3. The balance check requires 10 ether raw USDT units.
+      4. A seller with a normal USDT balance fails the check and cannot recover the allocation early.
+
+[29] MEDIUM  —  Maximum listing duration can make unlisting revert
+    location: SecondSwap_MarketplaceSetting.sol:setMinListingDuration lines 217-220 and SecondSwap_Marketplace.sol:unlistVesting line 349
+    what:     setMinListingDuration accepts type(uint256).max, while unlistVesting evaluates listing.listTime + minListingDuration using checked arithmetic.
+    impact:   Seller-initiated unlisting reverts for affected listings, leaving allocations in manager custody until the duration is changed or an administrator intervenes.
+    exploit:
+      1. Set minListingDuration to type(uint256).max.
+      2. Create a listing at a nonzero block timestamp.
+      3. Call unlistVesting as the seller.
+      4. The addition of listTime and the configured duration overflows before the early-unlisting condition can be evaluated.
+
+[30] MEDIUM  —  Zero USDT configuration blocks early unlisting
+    location: SecondSwap_MarketplaceSetting.sol:constructor lines 131-150 and SecondSwap_Marketplace.sol:unlistVesting lines 349-358
+    what:     The settings constructor accepts _usdt == address(0) and provides no setter for it. Early unlisting calls balanceOf and safeTransferFrom on the zero address.
+    impact:   Sellers cannot use the early-unlisting path and their allocations remain locked until the minimum duration expires or an administrator removes the listing.
+    exploit:
+      1. Deploy MarketplaceSetting with a zero USDT address.
+      2. Configure the marketplace and create a listing.
+      3. Before minListingDuration expires, call unlistVesting as the seller.
+      4. The balanceOf call to address(0) returns no ABI data and reverts.
+
+[31] MEDIUM  —  Zero integration addresses can disable marketplace paths
+    location: SecondSwap_MarketplaceSetting.sol:constructor lines 131-150
+    what:     The constructor validates feeCollector and s2Admin but accepts zero addresses for vestingManager and whitelistDeployer. Marketplace calls to these addresses expect contract return data or invoke deployment functions.
+    impact:   A zero vestingManager disables listing and vesting movement flows, while a zero whitelistDeployer disables private listing creation until the administrator repairs the setting.
+    exploit:
+      1. Deploy settings with vestingManager equal to address(0), or whitelistDeployer equal to address(0).
+      2. Configure the marketplace to use these settings.
+      3. For a zero vestingManager, call listVesting; the token lookup through address(0) reverts due to missing return data.
+      4. For a zero whitelistDeployer, create a private listing; deployWhitelist on address(0) reverts.
+
+[32] MEDIUM  —  Zero marketplace address disables manager operations
+    location: SecondSwap_VestingManager.sol:setMarketplace lines 204-205 and onlyMarketplace lines 89-91
+    what:     setMarketplace accepts address(0). All marketplace-facing functions require msg.sender == marketplace, so setting the value to zero rejects calls from the actual marketplace.
+    impact:   Listing, unlisting, purchasing, and marketplace token lookups are disabled until the administrator restores the correct marketplace address.
+    exploit:
+      1. As s2Admin, call setMarketplace(address(0)).
+      2. Have the configured marketplace call listVesting, unlistVesting, or completePurchase.
+      3. The onlyMarketplace modifier compares the nonzero caller with address(0) and reverts.
+
+[33] MEDIUM  —  Zero vesting deployer blocks new vesting deployments
+    location: SecondSwap_VestingManager.sol:setVestingDeployer lines 247-250 and setSellable lines 173-175
+    what:     setVestingDeployer permits address(0). deployVesting creates a plan and then calls manager.setSellable, but the manager authorizes that call only from s2Admin or the configured vestingDeployer. With the configured deployer set to zero, the deployer contract is rejected.
+    impact:   All new deployments through the vesting deployer revert until the manager configuration is repaired.
+    exploit:
+      1. As s2Admin, call setVestingDeployer(address(0)).
+      2. Have a registered token owner call deployVesting with valid parameters.
+      3. The deployer reaches manager.setSellable for the new plan.
+      4. The manager rejects the deployer because vestingDeployer is address(0), so the deployment transaction reverts.
+
+[34] MEDIUM  —  Zero manager blocks all new vesting deployments
+    location: SecondSwap_VestingDeployer.sol:setManager lines 152-155 and deployVesting lines 115-117
+    what:     setManager accepts address(0), while deployVesting later requires manager != address(0).
+    impact:   Once the manager is cleared, every subsequent vesting deployment reverts until an administrator restores a valid manager.
+    exploit:
+      1. As the deployer administrator, call setManager(address(0)).
+      2. Have a registered token owner call deployVesting with otherwise valid parameters.
+      3. The deployment reaches the manager-not-set check and reverts.
+
+[35] MEDIUM  —  Deployer and marketplace manager rotation can make new plans invisible
+    location: SecondSwap_VestingDeployer.sol:setManager lines 152-155 and deployVesting lines 119-130; SecondSwap_MarketplaceSetting.sol:setManager lines 285-291
+    what:     The deployer embeds its own manager address into newly created StepVesting plans and marks them sellable in that manager, while the marketplace independently reads its manager from MarketplaceSetting. If these addresses diverge, the marketplace queries a different manager whose vestingSettings entry for the new plan is not sellable.
+    impact:   Newly deployed plans cannot be listed through the marketplace during the mismatch, creating a recoverable denial of service for their intended sale flow.
+    exploit:
+      1. Configure the marketplace to use manager A and the deployer to use manager A.
+      2. Change only the deployer's manager to manager B.
+      3. Deploy a new vesting plan; B marks it sellable and stores B in the plan.
+      4. Attempt to list the plan through the marketplace, which forwards to A.
+      5. A has no sellable setting for the plan and rejects the listing.
+
+[36] MEDIUM  —  Referral rewards are calculated and reported incorrectly
+    location: SecondSwap_Marketplace.sol:_handleTransfers lines 478-492
+    what:     The contract calculates `referralFeeCost` as buyerFeeTotal minus the configured referral share, so a 10% referral setting produces approximately 90% of the buyer fee in the Purchased event. The value is never transferred to the referral address or referralFeeCollector; the full buyer and seller fees are sent to feeCollector.
+    impact:   Referral accounting is wrong and referrals receive no on-chain reward. Any distributor relying on referralReward can over-credit referrals based on the complement of the configured percentage.
+    exploit:
+      1. Configure referralFee to 1000 basis points and use a public listing.
+      2. Purchase the listing with a nonzero referral address different from the buyer.
+      3. Inspect the Purchased event; referralReward is approximately 90% of buyerFeeTotal instead of 10%.
+      4. Inspect token balances; no payment is sent to the referral address or referralFeeCollector, while the full fee is sent to feeCollector.
