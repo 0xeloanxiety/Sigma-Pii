@@ -1,0 +1,29 @@
+Loading codebase from: /home/divyanshtech/BLOCKCHAIN/AI-Auditor/Sigma-Pi/target/src
+Loaded 93,576 chars.
+Building protocol context (Part 2's build_context)...
+
+Asking the context-aware agent...
+
+=== 2 finding(s) ===
+
+[1] HIGH  —  Zero step duration permanently disables vesting claims
+    location: SecondSwap_VestingDeployer.sol:104-130; SecondSwap_StepVesting.sol:117-134, 161-174
+    what:     deployVesting only requires steps > 0 and startTime < endTime. It does not require endTime - startTime >= steps. Consequently, a deployment with a schedule shorter than its number of steps sets immutable stepDuration to zero. Once the schedule starts, claimable() evaluates elapsedTime / stepDuration and reverts with division by zero.
+    impact:   All allocations in the affected vesting plan become permanently unclaimable after the start time. The plan can still be marked sellable, listed, and purchased through the marketplace, so buyers can pay for vesting allocations that can never be claimed.
+    exploit:
+      1. A registered token owner calls deployVesting with startTime = T, endTime = T + 1, and steps = 2.
+      2. The StepVesting constructor calculates stepDuration = (endTime - startTime) / steps = 0.
+      3. The issuer creates and funds vesting allocations, and the plan is made sellable through the vesting manager.
+      4. A beneficiary or marketplace buyer receives an allocation in the plan.
+      5. After startTime, the beneficiary calls claim(); claimable() executes elapsedTime / stepDuration and reverts, permanently locking the allocation.
+
+[2] MEDIUM  —  Merging vesting allocations ignores the incoming allocation's claimed-step state
+    location: SecondSwap_StepVesting.sol:216-233, 288-304
+    what:     transferVesting passes the grantor's stepsClaimed to _createVesting, but when the beneficiary already has an allocation, _createVesting ignores the _stepsClaimed argument and retains the beneficiary's existing stepsClaimed and amountClaimed. It then recalculates releaseRate over the beneficiary's remaining steps for the combined total. This can treat an incoming allocation whose current vesting steps have already been claimed by the grantor as if those steps had not been claimed.
+    impact:   A buyer with an existing unclaimed allocation can claim portions of a purchased allocation before that allocation's remaining vesting schedule permits it. This breaks the time-based vesting invariant and creates value leakage through premature access to vested tokens.
+    exploit:
+      1. Create a 10-step plan and give a seller 1,000 tokens and a buyer a separate 1,000-token allocation.
+      2. Advance to step 5. The seller claims 500 tokens, making the seller's stepsClaimed equal to 5 while the remaining 500 tokens are future, unclaimed allocation.
+      3. The seller lists 200 of the remaining allocation, which is permitted under the default 20% sell limit. The manager receives an allocation with stepsClaimed = 5.
+      4. Before claiming their own allocation, the buyer purchases the 200 listed tokens. During the manager's transfer, the buyer already has a nonzero vesting record, so _createVesting keeps the buyer's stepsClaimed = 0 instead of the incoming value 5.
+      5. The buyer's combined allocation becomes 1,200 tokens with releaseRate = 120. At step 5, claimable() allows 600 tokens, whereas only the buyer's original 1,000-token allocation should have contributed 500 claimable tokens; 100 tokens from the purchased future allocation are released prematurely.

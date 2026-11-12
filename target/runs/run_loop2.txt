@@ -1,0 +1,138 @@
+Loading codebase from: /home/divyanshtech/BLOCKCHAIN/AI-Auditor/Sigma-Pi/target/src
+Loaded 93,576 chars.
+Building protocol context (Part 2's build_context)...
+
+Running find_bugs_loop for 5 round(s)...
+
+=== 12 finding(s) ===
+
+[1] CRITICAL  —  Uninitialized upgradeable contracts allow administrative takeover and vesting theft
+    location: SecondSwap_VestingManager.sol:107; SecondSwap_VestingDeployer.sol:77; SecondSwap_Marketplace.sol:180
+    what:     The upgradeable contracts expose public initializer functions but do not disable initialization in a constructor. If a proxy is deployed without initialization being performed atomically, any account can become the manager or deployer administrator. In particular, an attacker can initialize the VestingManager, set marketplace to an attacker-controlled address, and then invoke the manager's marketplace-only listing and purchase functions directly. The manager accepts an arbitrary seller in listVesting and the vesting plan recognizes the manager as an authorized transfer caller.
+    impact:   An attacker who wins initialization of an uninitialized VestingManager proxy can transfer available allocations from arbitrary beneficiaries into the manager and then transfer them to the attacker through completePurchase. An uninitialized VestingDeployer can likewise be taken over and used to invoke authorized transferVesting calls against plans deployed by that deployer.
+    exploit:
+      1. Deploy the VestingManager proxy without calling initialize in the same transaction.
+      2. Call SecondSwap_VestingManager.initialize(attacker) to become s2Admin.
+      3. Call setMarketplace(attacker) from the attacker account.
+      4. For a sellable vesting plan whose immutable manager is this proxy, call listVesting(victim, plan, amount). This transfers the victim's available vesting allocation to the manager because the manager is an authorized vesting caller.
+      5. Call completePurchase(attacker, plan, amount) from the attacker account to transfer the manager-held allocation to the attacker.
+      6. Alternatively, if the VestingDeployer proxy is uninitialized, initialize it as attacker, map attacker to the plan token through setTokenOwner, and call transferVesting with an arbitrary victim as grantor.
+
+[2] HIGH  —  Zero step duration permanently disables claims
+    location: SecondSwap_VestingDeployer.sol:115-116 and SecondSwap_StepVesting.sol:133, 172-174
+    what:     The deployer only checks that startTime < endTime and steps > 0, while SecondSwap_StepVesting computes stepDuration as (endTime - startTime) / numOfSteps without requiring the duration to be at least the number of steps. If the duration is smaller than the number of steps, stepDuration becomes zero. Once the vesting starts, claimable() divides by stepDuration, causing every claimable() and claim() call to revert.
+    impact:   All allocations in a vesting plan with this configuration become permanently unclaimable, locking the escrowed vesting tokens.
+    exploit:
+      1. A token owner deploys a vesting plan with startTime < endTime but endTime - startTime < steps, which the deployer accepts.
+      2. The token owner creates a vesting allocation and funds it through createVesting.
+      3. After startTime, the beneficiary calls claim().
+      4. claimable() executes elapsedTime / stepDuration with stepDuration == 0 and reverts, so the beneficiary cannot claim any tokens.
+
+[3] HIGH  —  Vesting transfers can make beneficiaries claim more than their remaining allocation
+    location: SecondSwap_StepVesting.sol:223-232
+    what:     After reducing a grantor's totalAmount during transferVesting, the contract recalculates releaseRate as grantorVesting.totalAmount / numOfSteps. This uses the post-transfer total allocation and the full number of steps, while amountClaimed and stepsClaimed remain unchanged. The rate must instead be based on the grantor's remaining unclaimed amount and remaining steps. Because claimable() uses releaseRate directly in its non-final branch without capping it against totalAmount - amountClaimed, a transfer after prior claims can cause amountClaimed to exceed totalAmount.
+    impact:   A beneficiary can withdraw more tokens than their unclaimed allocation, draining tokens belonging to other vesting allocations from the shared escrow. Subsequent claims can also permanently revert because the final-claim subtraction underflows.
+    exploit:
+      1. A user obtains a 100-token allocation in a 10-step plan and claims the first step, receiving 10 tokens. Their state is approximately totalAmount = 100, amountClaimed = 10, and stepsClaimed = 1.
+      2. The user buys or otherwise holds the allocation through the marketplace so that their recorded bought amount is at least 90, then lists 90 tokens. The marketplace's sell-limit calculation permits selling up to the bought amount, and the vesting manager transfers 90 tokens out.
+      3. transferVesting reduces totalAmount to 10 but leaves amountClaimed at 10 and sets releaseRate to 10 / 10 = 1.
+      4. At each of steps 2 through 9, the beneficiary calls claim(). The contract pays 1 token per step even though their remaining unclaimed allocation is already zero, resulting in amountClaimed = 18 while totalAmount = 10.
+      5. At the final step, claimable() attempts totalAmount - amountClaimed and reverts due to underflow.
+
+[4] HIGH  —  Token-owner authorization is not bound to the vesting plan issuer
+    location: SecondSwap_VestingDeployer.sol:141-144, 176-182, 218-230
+    what:     setTokenOwner only checks whether the supplied owner address is already mapped; it does not prevent the same token from being mapped to multiple owners. The createVesting and transferVesting wrappers then authorize a caller solely by comparing _tokenOwner[msg.sender] with the selected vesting contract's token. They never verify that the caller is the plan's immutable tokenIssuer. Because the deployer itself is authorized by every StepVesting it deployed, any mapped owner of the same token can invoke the wrapper against another owner's plan.
+    impact:   If two addresses are mapped to the same token, either address can transfer another issuer's beneficiaries' vesting allocations to an attacker-controlled address, or create allocations funded from the plan issuer's approved token balance. A malicious mapped owner can therefore steal unclaimed vesting allocations from plans created by another mapped owner.
+    exploit:
+      1. Have the administrator map owner A to token T using setTokenOwner(T, A), and map attacker B to the same token T using setTokenOwner(T, B); the contract permits both mappings.
+      2. Owner A deploys a StepVesting plan P for token T and creates a vesting allocation for victim V.
+      3. Attacker B calls transferVesting(V, B, amount, P, transactionId) on the deployer.
+      4. The wrapper accepts B because _tokenOwner[B] == P.token(). The deployer then calls P.transferVesting; P sees the deployer as its authorized vestingDeployer and transfers V's allocation to B.
+      5. B waits for vesting release and claims the transferred allocation.
+
+[5] MEDIUM  —  Referral rewards are calculated but never transferred
+    location: SecondSwap_Marketplace.sol:478-492
+    what:     _handleTransfers calculates referralFeeCost for public purchases with a nonzero referral and spotPurchase emits that value as referralReward, but no transfer is made to _referral or to referralFeeCollector. The buyer pays the full buyer fee, and the entire buyerFeeTotal is instead transferred to feeCollector.
+    impact:   Referrers receive no referral reward despite the event claiming that a reward was paid. The referral portion of buyer fees is mis-accounted and is retained by the fee collector.
+    exploit:
+      1. A buyer selects a public listing and supplies a nonzero referral address different from their own.
+      2. spotPurchase calls _handleTransfers, which computes a positive referralFeeCost.
+      3. The buyer is charged baseAmount + buyerFeeTotal.
+      4. _handleTransfers transfers the seller proceeds and the full buyerFeeTotal plus sellerFeeTotal to feeCollector, without any transfer to the referral address.
+      5. spotPurchase emits Purchased with referralReward set to referralFeeCost even though the referral received zero tokens.
+
+[6] MEDIUM  —  Claiming at the schedule end can set stepsClaimed above numOfSteps
+    location: SecondSwap_StepVesting.sol:167-185, 193-201, 288-303
+    what:     claimable() calculates currentStep as elapsedTime / stepDuration without capping it to numOfSteps. For schedules whose duration is not evenly divisible by the number of steps, currentStep at endTime can exceed numOfSteps. The final-branch claimable amount is capped correctly, but claim() still adds the excessive claimableSteps to vesting.stepsClaimed. For example, an 8-second schedule with 3 steps has stepDuration 2 and currentStep 4 at endTime, so claiming sets stepsClaimed to 4 even though numOfSteps is 3. Any later allocation added to that beneficiary enters _createVesting()'s existing-beneficiary branch and evaluates numOfSteps - stepsClaimed, which underflows.
+    impact:   The beneficiary's vesting state becomes inconsistent and future vesting additions to that address revert permanently. Marketplace purchases to the address also revert in completePurchase() when the manager attempts to transfer the purchased allocation, preventing that address from receiving further vesting allocations.
+    exploit:
+      1. Deploy a valid vesting plan with startTime < endTime, for example an 8-second duration and 3 steps; deployment accepts this because only steps > 0 is checked.
+      2. Create an allocation for a beneficiary.
+      3. Wait until endTime and call claim(). stepDuration is 2, currentStep is 4, and claim() increments stepsClaimed by 4, leaving stepsClaimed = 4 while numOfSteps = 3.
+      4. Have the token issuer call createVesting() for the same beneficiary, or have the beneficiary purchase an allocation through the marketplace.
+      5. The existing-beneficiary path evaluates numOfSteps - stepsClaimed and underflows, causing the allocation creation or marketplace purchase to revert.
+
+[7] MEDIUM  —  Per-fill payment rounding lets buyers underpay listings
+    location: SecondSwap_Marketplace.sol:459-471
+    what:     The payment amount is calculated as floor(_amount * discountedPrice / 10**decimals) independently for every purchase. Because each partial purchase is rounded down separately, splitting a purchase into multiple fills can produce a materially lower total payment than purchasing the same amount in one fill.
+    impact:   A buyer can acquire the full listed vesting allocation for less than the configured price, with the seller receiving less payment than the listing price specifies.
+    exploit:
+      1. Use a vesting token with 1 decimal and create a public PARTIAL listing for amount 10, pricePerUnit 15, no discount, and minPurchaseAmt 1.
+      2. Approve the marketplace to spend the payment currency.
+      3. Call spotPurchase ten times for amount 1, using a zero referral.
+      4. Each purchase computes baseAmount as floor(1 * 15 / 10) = 1, so the buyer pays 10 total.
+      5. A single purchase of amount 10 would compute floor(10 * 15 / 10) = 15, so the buyer has underpaid by 5 payment units while receiving the same 10 vesting units.
+
+[8] MEDIUM  —  Unsupported high-decimal vesting tokens permanently disable marketplace trading
+    location: SecondSwap_Marketplace.sol:276-288 and 459-471
+    what:     The marketplace only checks that the vesting token exposes a decimals() function. It does not bound the returned uint8 value before evaluating 10 ** decimals. For decimals values of 78 or higher, the uint256 exponentiation overflows and reverts.
+    impact:   Any otherwise valid vesting plan using an ERC20 whose decimals() returns 78 or more cannot be listed or purchased through the marketplace. The failure occurs before listing state is created, permanently disabling marketplace support for that plan.
+    exploit:
+      1. Deploy or select an ERC20 whose decimals() function returns a value of at least 78.
+      2. Use the vesting deployer to create a StepVesting plan for that token and mark it sellable through the vesting manager.
+      3. Call listVesting for the plan with a valid amount and price.
+      4. doesFunctionExist succeeds because decimals() exists, but the subsequent 10 ** decimals calculation overflows and reverts.
+      5. Any attempted purchase would fail at the same exponentiation in _handleTransfers.
+
+[9] MEDIUM  —  Vesting manager aggregation discards the source allocation's vesting progress
+    location: SecondSwap_StepVesting.sol:288-303; SecondSwap_VestingManager.sol:139 and 163
+    what:     The vesting manager aggregates all listed allocations under its own address. transferVesting passes the source grantor's stepsClaimed when creating a new beneficiary, but when the manager already has an allocation, _createVesting ignores the incoming _stepsClaimed and retains the manager's existing stepsClaimed and release schedule. Purchases then transfer from the manager using that aggregated step state rather than the source seller's state.
+    impact:   A buyer's purchased allocation can vest earlier or later than the seller's allocation it came from. In particular, an allocation whose source beneficiary has already reached later vesting steps can be transferred through a manager allocation still at step zero, allowing the buyer to claim tokens before the source allocation's vesting state would permit it.
+    exploit:
+      1. At the beginning of a vesting schedule, have one seller list an allocation so the manager receives its first allocation with stepsClaimed equal to 0.
+      2. After the schedule reaches step 5, have a second seller with stepsClaimed equal to 5 and an unclaimed balance list part of that allocation.
+      3. The manager receives the second allocation through transferVesting, but because the manager already has a nonzero totalAmount, _createVesting ignores the incoming _stepsClaimed value of 5 and retains the manager's value of 0.
+      4. Buy the second seller's listing. completePurchase transfers from the manager and creates the buyer's allocation with stepsClaimed equal to 0.
+      5. At step 5, the buyer can claim five steps of the purchased allocation immediately, even though the source seller's allocation had already progressed to step 5 and its transfer state should have preserved that progress.
+
+[10] MEDIUM  —  USDT penalty uses raw 18-decimal units and can make early delisting impractical
+    location: SecondSwap_MarketplaceSetting.sol:142-150; SecondSwap_Marketplace.sol:349-358
+    what:     The default penaltyFee is set to 10 ether, but the marketplace transfers that raw integer amount from the configured USDT token without converting it to USDT's decimals. For a conventional 6-decimal USDT deployment, this means an early delisting requires 10^19 base units, or 10,000,000,000,000 USDT, rather than 10 USDT.
+    impact:   Sellers using a normal 6-decimal USDT balance cannot satisfy the early-delisting requirement and cannot recover their listed allocation before minListingDuration expires. The allocation remains locked in the vesting manager until the duration elapses, creating a recoverable denial of service for early delisting.
+    exploit:
+      1. Configure the marketplace with a standard 6-decimal USDT token and leave the constructor's default penaltyFee of 10 ether unchanged.
+      2. A seller lists an allocation and immediately calls unlistVesting.
+      3. The marketplace checks for a balance of 10^19 USDT base units and then attempts safeTransferFrom for that same amount.
+      4. The seller's ordinary USDT balance and allowance are insufficient, so unlistVesting reverts.
+      5. The seller must wait until minListingDuration has elapsed before the penalty branch is skipped and the allocation can be returned.
+
+[11] MEDIUM  —  Fee-on-transfer payment tokens break settlement and underpay recipients
+    location: SecondSwap_Marketplace.sol:476-492
+    what:     _handleTransfers assumes that safeTransferFrom(msg.sender, address(this), baseAmount + buyerFeeTotal) credits the marketplace with exactly the requested amount, and that subsequent transfers debit exactly the requested amounts. The supported-token mechanism does not reject fee-on-transfer or deflationary ERC20s. With such a token, the marketplace receives less than expected and later seller or fee-collector transfers can revert; if outgoing transfers succeed with a tax, the seller and fee collector receive less than the amounts recorded and intended.
+    impact:   Purchases denominated in a supported fee-on-transfer token can be permanently unexecutable, locking listed allocations until sellers can delist. If the token's transfers do not revert despite the tax, sellers and fee collectors receive less than the settlement amounts guaranteed by the marketplace.
+    exploit:
+      1. Have the administrator add a fee-on-transfer token through addCoin.
+      2. A seller creates a listing using that token as currency.
+      3. A buyer approves the marketplace for the quoted base amount plus buyer fees and calls spotPurchase.
+      4. The token's transferFrom succeeds but credits the marketplace with less than the requested amount.
+      5. The marketplace attempts to transfer the full seller amount and fee amount, causing settlement to revert due to insufficient balance, or the token tax causes recipients to receive less than the requested amounts.
+
+[12] MEDIUM  —  Deflationary vested tokens can permanently undercollateralize vesting plans
+    location: SecondSwap_StepVesting.sol:288-307 and 193-202
+    what:     _createVesting records _totalAmount in totalAmount after calling token.safeTransferFrom(tokenIssuer, address(this), _totalAmount), without checking the contract's actual balance increase. With a fee-on-transfer vested token, the contract receives less than _totalAmount while the beneficiary is still credited with the full amount. At the end of the schedule, claimable returns the full recorded remainder and claim() attempts to transfer it, even though the vesting contract may not hold enough tokens.
+    impact:   Users of a fee-on-transfer vesting token can receive less than their recorded allocation or have the final claim revert indefinitely due to insufficient token balance. The claim accounting cannot be advanced when the transfer reverts, so the undercollateralized portion remains locked unless someone separately tops up the vesting contract.
+    exploit:
+      1. Use a vested ERC20 token that charges a transfer fee when tokenIssuer transfers tokens to the vesting contract.
+      2. Create a vesting allocation of 100 tokens. _createVesting records totalAmount as 100, but a 10% transfer fee causes the contract to receive only 90.
+      3. Advance time to the end of the vesting schedule and call claim(). claimable() returns the full remaining recorded allocation of 100.
+      4. The token transfer of 100 cannot be funded from the contract's 90-token balance and reverts, leaving the final claim unavailable; if the token instead taxes outgoing transfers, the beneficiary receives less than the recorded allocation.

@@ -1,0 +1,48 @@
+Loading codebase from: /home/divyanshtech/BLOCKCHAIN/AI-Auditor/Sigma-Pi/target/src
+Loaded 93,576 chars.
+Building protocol context (Part 2's build_context)...
+
+Asking the context-aware agent...
+
+=== 4 finding(s) ===
+
+[1] HIGH  —  Vesting schedules with zero step duration permanently disable claims
+    location: SecondSwap_StepVesting.sol:133 and SecondSwap_VestingDeployer.sol:104-130
+    what:     The deployer validates only startTime < endTime and steps > 0, but does not require endTime - startTime >= steps. The constructor computes stepDuration = (endTime - startTime) / numOfSteps, which becomes zero when the number of steps exceeds the schedule duration. Once the schedule starts, claimable() executes elapsedTime / stepDuration at line 173 and reverts due to division by zero.
+    impact:   All allocations in such a schedule become unclaimable through claim(), permanently locking the vested tokens unless an authorized issuer or deployer manually transfers the allocations elsewhere. A token owner can also sell allocations from the malformed schedule, causing buyers to receive vesting rights that cannot be claimed.
+    exploit:
+      1. Have a mapped token owner call deployVesting with startTime = T, endTime = T + 1, and steps = 2.
+      2. Create a vesting allocation in the resulting contract and list or sell that allocation through the marketplace.
+      3. After T + 1, call claim() as the beneficiary.
+      4. claimable() divides by stepDuration == 0 and reverts, so the beneficiary cannot claim any allocation.
+
+[2] MEDIUM  —  Non-divisible vesting durations release allocations early and overshoot steps
+    location: SecondSwap_StepVesting.sol:167-181
+    what:     stepDuration is rounded down in the constructor. claimable() computes currentStep as (currentTime - startTime) / stepDuration but never caps currentStep to numOfSteps. For example, a ten-second schedule with four steps gets a two-second stepDuration, so currentStep reaches four at t = start + 8, two seconds before endTime. At endTime, currentStep can exceed numOfSteps and the returned claimableSteps can exceed the configured step count.
+    impact:   Beneficiaries can claim their entire allocation before endTime. When an oversized claimableSteps value is stored in stepsClaimed, later additions or transfers to that beneficiary can revert because _createVesting subtracts stepsClaimed from numOfSteps, permanently blocking subsequent allocations for that address.
+    exploit:
+      1. Deploy a schedule with startTime = T, endTime = T + 10, and steps = 4.
+      2. Create a beneficiary allocation.
+      3. At T + 8, call claim(); currentStep is already 4, so claimable() returns the entire remaining allocation even though endTime has not arrived.
+      4. Alternatively, wait until T + 10 and claim; currentStep is 5, so stepsClaimed is increased beyond numOfSteps.
+      5. Attempt to create or transfer another allocation to the same beneficiary; _createVesting evaluates numOfSteps - stepsClaimed and reverts.
+
+[3] MEDIUM  —  Transfers through an already-funded manager schedule corrupt vesting release timing
+    location: SecondSwap_StepVesting.sol:216-232 and 288-303
+    what:     transferVesting passes the source's stepsClaimed value to _createVesting, but when the beneficiary already has a vesting record, _createVesting ignores the incoming _stepsClaimed and recalculates using the beneficiary's existing stepsClaimed. The vesting manager is itself the beneficiary for all listed allocations, so allocations from sellers at different claim stages are merged into a single schedule and later purchases inherit the manager's unrelated step count.
+    impact:   A purchased allocation can become claimable earlier or later than the source allocation's vesting schedule. In particular, if the manager first receives an unclaimed allocation with stepsClaimed = 0 and later receives an allocation from a seller who has already claimed eight of ten steps, a buyer of the latter allocation receives stepsClaimed = 0 and can claim most of it immediately instead of waiting for the final two steps.
+    exploit:
+      1. Use a ten-step vesting plan and have seller B list an unclaimed allocation first, causing the manager's vesting record to have stepsClaimed = 0.
+      2. Have seller A claim the first eight steps of another allocation, leaving only the final two-step allocation available, and list that remaining allocation.
+      3. The manager transfers seller A's allocation using _createVesting(..., _stepsClaimed = 8, true), but because the manager already has a record, its stepsClaimed remains 0.
+      4. Purchase seller A's listing at step eight and call claim() as the buyer; the buyer's new record inherits stepsClaimed = 0 and can claim accrued early-step amounts that should remain locked until the final steps.
+
+[4] MEDIUM  —  Referral rewards are calculated but never paid
+    location: SecondSwap_Marketplace.sol:478-492
+    what:     _handleTransfers calculates referralFeeCost and returns it for the Purchased event, but no transfer to the referral address or referralFeeCollector is performed. The subsequent fee transfer sends the full buyerFeeTotal plus sellerFeeTotal to feeCollector. MarketplaceSetting stores referralFeeCollector at line 69 but provides no setter, and the marketplace does not expose or use it.
+    impact:   Referrers receive no payment despite Purchased.referralReward reporting a nonzero reward. The fee collector retains the amount represented as the referral reward, creating a persistent accounting mismatch and depriving referrers of their configured rewards.
+    exploit:
+      1. Create an active public listing with a nonzero buyer fee.
+      2. Have a buyer call spotPurchase with a distinct nonzero referral address.
+      3. _handleTransfers computes a nonzero referralFeeCost.
+      4. Observe that the payment transfers go only to the seller and feeCollector; the referral address balance is unchanged while the event reports a referral reward.
